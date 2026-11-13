@@ -1,0 +1,63 @@
+# Manual deploy to Azure with OpenID Connect (no stored passwords).
+# Repo secrets: AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID (federated credential on the app registration).
+name: deploy
+on:
+  workflow_dispatch:
+    inputs:
+      resource_group: {description: "Resource group", default: "rg-azure-rag-search"}
+      location: {description: "Azure region with gpt-4o-mini and text-embedding-3-small", default: "swedencentral"}
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      RG: ${{ inputs.resource_group }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Phase 1 - platform (OpenAI, AI Search, registry, identity, RBAC)
+        id: infra
+        run: |
+          az group create -n "$RG" -l "${{ inputs.location }}" -o none
+          PRINCIPAL=$(az ad sp show --id "${{ secrets.AZURE_CLIENT_ID }}" --query id -o tsv)
+          echo "principal=$PRINCIPAL" >> "$GITHUB_OUTPUT"
+          OUT=$(az deployment group create -g "$RG" -f infra/main.bicep \
+                  -p deployerPrincipalId="$PRINCIPAL" deployApp=false --query properties.outputs -o json)
+          echo "registry=$(jq -r .registryName.value <<<"$OUT")" >> "$GITHUB_OUTPUT"
+          echo "openai=$(jq -r .openAiEndpoint.value <<<"$OUT")" >> "$GITHUB_OUTPUT"
+          echo "search=$(jq -r .searchEndpoint.value <<<"$OUT")" >> "$GITHUB_OUTPUT"
+
+      - name: Build image in ACR
+        run: az acr build -r "${{ steps.infra.outputs.registry }}" -t "azure-rag-search:${{ github.sha }}" .
+
+      - name: Index documents
+        env:
+          AZURE_OPENAI_ENDPOINT: ${{ steps.infra.outputs.openai }}
+          AZURE_SEARCH_ENDPOINT: ${{ steps.infra.outputs.search }}
+        run: |
+          pip install -r requirements.txt
+          sleep 60   # RBAC assignments take a moment to propagate
+          python -m app.indexer
+
+      - name: Phase 2 - container app
+        id: app
+        run: |
+          URL=$(az deployment group create -g "$RG" -f infra/main.bicep \
+                  -p deployerPrincipalId="${{ steps.infra.outputs.principal }}" deployApp=true imageTag="${{ github.sha }}" \
+                  --query properties.outputs.appUrl.value -o tsv)
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test and eval against Azure
+        env:
+          AZURE_OPENAI_ENDPOINT: ${{ steps.infra.outputs.openai }}
+          AZURE_SEARCH_ENDPOINT: ${{ steps.infra.outputs.search }}
+        run: |
+          curl -fsS "${{ steps.app.outputs.url }}/healthz"
+          python -m evals.run
